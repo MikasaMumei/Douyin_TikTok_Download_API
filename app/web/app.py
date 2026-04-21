@@ -11,6 +11,7 @@ from app.web.views.Document import api_document_pop_window
 from app.web.views.Downloader import downloader_pop_window
 from app.web.views.EasterEgg import a
 from app.web.views.ParseVideo import parse_video
+from app.web.views.ParseUserPosts import parse_user_posts
 from app.web.views.Shortcuts import ios_pop_window
 # PyWebIO的各个视图/Views of PyWebIO
 from app.web.views.ViewsUtils import ViewsUtils
@@ -87,6 +88,6 @@ class MainView:
             if select_options == options[0]:
                 parse_video()
             elif select_options == options[1]:
-                put_markdown(self.utils.t('暂未开放，敬请期待~', 'Not yet open, please look forward to it~'))
+                parse_user_posts()
             elif select_options == options[2]:
                 a() if _config['Web']['Easter_Egg'] else put_markdown(self.utils.t('没有小彩蛋哦~', 'No Easter Egg~'))

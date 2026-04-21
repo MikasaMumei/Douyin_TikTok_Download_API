@@ -10,6 +10,10 @@ router = APIRouter()
 DouyinWebCrawler = DouyinWebCrawler()
 
 
+def _split_tags(tags: str) -> List[str]:
+    return [tag.strip() for tag in tags.split(",") if tag.strip()]
+
+
 # 获取单个作品数据
 @router.get("/fetch_one_video", response_model=ResponseModel, summary="获取单个作品数据/Get single video data")
 async def fetch_one_video(request: Request,
@@ -89,6 +93,103 @@ async def fetch_user_post_videos(request: Request,
                              router=request.url.path,
                              data=data)
     except Exception as e:
+        status_code = 400
+        detail = ErrorResponseModel(code=status_code,
+                                    router=request.url.path,
+                                    params=dict(request.query_params),
+                                    )
+        raise HTTPException(status_code=status_code, detail=detail.dict())
+
+
+@router.get("/fetch_user_post_videos_batch", response_model=ResponseModel,
+            summary="批量获取用户主页作品并按条件过滤/Get user homepage videos in batch with filters")
+async def fetch_user_post_videos_batch(
+        request: Request,
+        profile_url: str = Query(default="", description="用户主页链接/User homepage link"),
+        sec_user_id: str = Query(default="", description="用户sec_user_id/User sec_user_id"),
+        max_pages: int = Query(default=5, ge=1, le=50, description="最大抓取页数/Max pages"),
+        page_size: int = Query(default=20, ge=1, le=50, description="每页数量/Page size"),
+        max_items: int = Query(default=100, ge=1, le=500, description="最大作品数/Max items"),
+        keyword: str = Query(default="", description="标题关键词/Title keyword"),
+        tags: str = Query(default="", description="标签列表，逗号分隔/Comma separated tags"),
+        title_regex: str = Query(default="", description="标题正则/Title regex"),
+        min_digg: int = Query(default=0, ge=0, description="最低点赞数/Minimum likes"),
+        start_time: int = Query(default=0, ge=0, description="开始时间戳/Start timestamp"),
+        end_time: int = Query(default=0, ge=0, description="结束时间戳/End timestamp"),
+        aweme_type: str = Query(default="all", pattern="^(all|video|image)$", description="作品类型/all|video|image"),
+        match_mode: str = Query(default="any", pattern="^(any|all)$", description="标签匹配模式 any/all"),
+        sleep_interval: float = Query(default=0.0, ge=0.0, le=5.0, description="分页等待秒数/Page sleep interval"),
+):
+    try:
+        if not profile_url and not sec_user_id:
+            raise ValueError("profile_url or sec_user_id is required")
+
+        batch_data = (
+            await DouyinWebCrawler.get_user_post_videos_batch_by_profile_url(
+                profile_url=profile_url,
+                max_pages=max_pages,
+                page_size=page_size,
+                max_items=max_items,
+                sleep_interval=sleep_interval,
+            )
+            if profile_url else
+            await DouyinWebCrawler.fetch_user_post_videos_batch(
+                sec_user_id=sec_user_id,
+                max_pages=max_pages,
+                page_size=page_size,
+                max_items=max_items,
+                sleep_interval=sleep_interval,
+            )
+        )
+
+        filtered_items = DouyinWebCrawler.filter_user_post_videos(
+            aweme_list=batch_data.get("aweme_list", []),
+            keyword=keyword,
+            tags=_split_tags(tags),
+            title_regex=title_regex,
+            min_digg=min_digg,
+            start_time=start_time or None,
+            end_time=end_time or None,
+            aweme_type=aweme_type,
+            match_mode=match_mode,
+        )
+        return ResponseModel(
+            code=200,
+            router=request.url.path,
+            data={
+                "profile_url": profile_url,
+                "sec_user_id": batch_data.get("sec_user_id") or sec_user_id,
+                "user": batch_data.get("user", {}),
+                "filters": {
+                    "keyword": keyword,
+                    "tags": _split_tags(tags),
+                    "title_regex": title_regex,
+                    "min_digg": min_digg,
+                    "start_time": start_time,
+                    "end_time": end_time,
+                    "aweme_type": aweme_type,
+                    "match_mode": match_mode,
+                },
+                "pagination": {
+                    "max_pages": max_pages,
+                    "page_size": page_size,
+                    "max_items": max_items,
+                    "next_cursor": batch_data.get("max_cursor", 0),
+                    "has_more": batch_data.get("has_more", 0),
+                    "fetched_pages": batch_data.get("fetched_pages", 0),
+                },
+                "fetch_diagnostics": {
+                    "raw_total": batch_data.get("raw_total", 0),
+                    "duplicate_count": batch_data.get("duplicate_count", 0),
+                    "warning": batch_data.get("warning", ""),
+                    "warning_detail": batch_data.get("warning_detail", ""),
+                },
+                "total_fetched": batch_data.get("total", 0),
+                "total_filtered": len(filtered_items),
+                "items": filtered_items,
+            }
+        )
+    except Exception:
         status_code = 400
         detail = ErrorResponseModel(code=status_code,
                                     router=request.url.path,

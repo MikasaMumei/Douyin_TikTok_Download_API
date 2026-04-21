@@ -35,7 +35,9 @@
 
 import asyncio  # 异步I/O
 import os  # 系统操作
+import re
 import time  # 时间操作
+from typing import List, Optional
 from urllib.parse import urlencode, quote  # URL编码
 import yaml  # 配置文件
 
@@ -68,6 +70,222 @@ with open(f"{path}/config.yaml", "r", encoding="utf-8") as f:
 
 
 class DouyinWebCrawler:
+
+    HASHTAG_PATTERN = re.compile(r"#([^#\s]+)")
+
+    @staticmethod
+    def _extract_hashtags(text_extra: Optional[List]) -> List[str]:
+        hashtags = []
+        for item in text_extra or []:
+            tag_name = (
+                item.get("hashtag_name")
+                or item.get("tag_name")
+                or item.get("hashtag")
+                or item.get("name")
+            )
+            if tag_name:
+                hashtags.append(str(tag_name).lstrip("#"))
+        return hashtags
+
+    @classmethod
+    def _extract_desc_hashtags(cls, desc: str) -> List[str]:
+        return [match.strip().lstrip("#") for match in cls.HASHTAG_PATTERN.findall(desc or "") if match.strip()]
+
+    def _build_minimal_aweme_data(self, aweme: dict) -> dict:
+        aweme_type = aweme.get("aweme_type")
+        url_type_code_dict = {
+            2: 'image',
+            4: 'video',
+            68: 'image',
+        }
+        content_type = url_type_code_dict.get(aweme_type, 'video')
+        hashtags = self._extract_hashtags(aweme.get("text_extra"))
+        hashtags.extend(self._extract_desc_hashtags(aweme.get("desc", "")))
+        hashtags = list(dict.fromkeys(tag for tag in hashtags if tag))
+        result = {
+            "type": content_type,
+            "platform": "douyin",
+            "video_id": aweme.get("aweme_id"),
+            "aweme_id": aweme.get("aweme_id"),
+            "desc": aweme.get("desc", ""),
+            "create_time": aweme.get("create_time"),
+            "author": aweme.get("author", {}),
+            "statistics": aweme.get("statistics", {}),
+            "hashtags": hashtags,
+            "text_extra": aweme.get("text_extra", []),
+            "cover_data": {
+                "cover": aweme.get("video", {}).get("cover"),
+                "origin_cover": aweme.get("video", {}).get("origin_cover"),
+                "dynamic_cover": aweme.get("video", {}).get("dynamic_cover")
+            }
+        }
+
+        if content_type == "video":
+            play_addr = aweme.get("video", {}).get("play_addr", {})
+            url_list = play_addr.get("url_list", [])
+            uri = play_addr.get("uri", "")
+            wm_video_url_hq = url_list[0] if url_list else ""
+            result["video_data"] = {
+                "wm_video_url": f"https://aweme.snssdk.com/aweme/v1/playwm/?video_id={uri}&radio=1080p&line=0" if uri else wm_video_url_hq,
+                "wm_video_url_HQ": wm_video_url_hq,
+                "nwm_video_url": f"https://aweme.snssdk.com/aweme/v1/play/?video_id={uri}&ratio=1080p&line=0" if uri else wm_video_url_hq,
+                "nwm_video_url_HQ": wm_video_url_hq.replace('playwm', 'play') if wm_video_url_hq else ""
+            }
+        else:
+            no_watermark_image_list = []
+            watermark_image_list = []
+            for image in aweme.get("images", []):
+                no_watermark_image_list.append((image.get("url_list") or [""])[0])
+                watermark_image_list.append((image.get("download_url_list") or [""])[0])
+            result["image_data"] = {
+                "no_watermark_image_list": no_watermark_image_list,
+                "watermark_image_list": watermark_image_list,
+            }
+        return result
+
+    async def fetch_user_post_videos_batch(
+        self,
+        sec_user_id: str,
+        max_pages: int = 5,
+        page_size: int = 20,
+        max_items: int = 100,
+        start_cursor: int = 0,
+        sleep_interval: float = 0.0,
+    ):
+        aweme_list = []
+        seen_aweme_ids = set()
+        cursor = start_cursor
+        has_more = 0
+        user_info = {}
+        raw_total = 0
+        duplicate_count = 0
+        fetched_pages = 0
+        warning = ""
+        warning_detail = ""
+
+        for _ in range(max_pages):
+            response = await self.fetch_user_post_videos(sec_user_id, cursor, page_size)
+            page_aweme_list = response.get("aweme_list", [])
+            raw_total += len(page_aweme_list)
+            has_more = response.get("has_more", 0)
+            next_cursor = response.get("max_cursor", cursor)
+            user_info = response.get("user") or user_info
+            fetched_pages += 1
+
+            if not page_aweme_list and cursor != start_cursor:
+                warning = "empty_page"
+                warning_detail = "Douyin returned an empty follow-up page, so the current results may be incomplete."
+                has_more = 0
+                break
+
+            for aweme in page_aweme_list:
+                aweme_id = aweme.get("aweme_id")
+                if aweme_id and aweme_id in seen_aweme_ids:
+                    duplicate_count += 1
+                    continue
+                if aweme_id:
+                    seen_aweme_ids.add(aweme_id)
+                aweme_list.append(aweme)
+
+            if len(aweme_list) >= max_items:
+                aweme_list = aweme_list[:max_items]
+                break
+
+            if not has_more:
+                break
+
+            if not page_aweme_list:
+                warning = "empty_page"
+                warning_detail = "Douyin returned has_more but the next page had no aweme_list."
+                break
+
+            if next_cursor in (None, "", cursor):
+                warning = "cursor_stalled"
+                warning_detail = "Douyin returned has_more but the pagination cursor did not advance."
+                break
+
+            cursor = next_cursor
+
+            if sleep_interval > 0:
+                await asyncio.sleep(sleep_interval)
+
+        return {
+            "sec_user_id": sec_user_id,
+            "user": user_info,
+            "aweme_list": aweme_list,
+            "max_cursor": cursor,
+            "has_more": has_more,
+            "total": len(aweme_list),
+            "raw_total": raw_total,
+            "duplicate_count": duplicate_count,
+            "fetched_pages": fetched_pages,
+            "warning": warning,
+            "warning_detail": warning_detail,
+        }
+
+    async def get_user_post_videos_batch_by_profile_url(
+        self,
+        profile_url: str,
+        max_pages: int = 5,
+        page_size: int = 20,
+        max_items: int = 100,
+        start_cursor: int = 0,
+        sleep_interval: float = 0.0,
+    ):
+        sec_user_id = await self.get_sec_user_id(profile_url)
+        return await self.fetch_user_post_videos_batch(
+            sec_user_id=sec_user_id,
+            max_pages=max_pages,
+            page_size=page_size,
+            max_items=max_items,
+            start_cursor=start_cursor,
+            sleep_interval=sleep_interval,
+        )
+
+    def filter_user_post_videos(
+        self,
+        aweme_list: list,
+        keyword: str = "",
+        tags: Optional[List[str]] = None,
+        title_regex: str = "",
+        min_digg: int = 0,
+        start_time: Optional[int] = None,
+        end_time: Optional[int] = None,
+        aweme_type: str = "all",
+        match_mode: str = "any",
+    ):
+        normalized_tags = [str(tag).strip().lstrip("#").lower() for tag in (tags or []) if str(tag).strip()]
+        normalized_keyword = keyword.strip().lower()
+        regex = re.compile(title_regex, re.IGNORECASE) if title_regex else None
+        filtered = []
+
+        for aweme in aweme_list:
+            item = self._build_minimal_aweme_data(aweme)
+            desc = (item.get("desc") or "").lower()
+            hashtags = {tag.lower() for tag in item.get("hashtags", [])}
+            create_time = item.get("create_time") or 0
+            digg_count = item.get("statistics", {}).get("digg_count", 0)
+
+            if normalized_keyword and normalized_keyword not in desc:
+                continue
+            if regex and not regex.search(item.get("desc") or ""):
+                continue
+            if normalized_tags:
+                matcher = all if match_mode == "all" else any
+                if not matcher(tag in hashtags or f"#{tag}" in desc for tag in normalized_tags):
+                    continue
+            if min_digg and digg_count < min_digg:
+                continue
+            if start_time and create_time < start_time:
+                continue
+            if end_time and create_time > end_time:
+                continue
+            if aweme_type in {"video", "image"} and item.get("type") != aweme_type:
+                continue
+
+            filtered.append(item)
+
+        return filtered
 
     # 从配置文件中获取抖音的请求头
     async def get_douyin_headers(self):

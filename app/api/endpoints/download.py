@@ -2,6 +2,8 @@ import os
 import zipfile
 import subprocess
 import tempfile
+import json
+import re
 
 import aiofiles
 import httpx
@@ -10,10 +12,12 @@ from fastapi import APIRouter, Request, Query, HTTPException  # 导入FastAPI组
 from starlette.responses import FileResponse
 
 from app.api.models.APIResponseModel import ErrorResponseModel  # 导入响应模型
+from crawlers.douyin.web.web_crawler import DouyinWebCrawler
 from crawlers.hybrid.hybrid_crawler import HybridCrawler  # 导入混合数据爬虫
 
 router = APIRouter()
 HybridCrawler = HybridCrawler()
+DouyinWebCrawler = DouyinWebCrawler()
 
 # 读取上级再上级目录的配置文件
 config_path = os.path.join(os.path.dirname(os.path.dirname(os.path.dirname(os.path.dirname(__file__)))), 'config.yaml')
@@ -107,6 +111,105 @@ async def merge_bilibili_video_audio(video_url: str, audio_url: str, request: Re
             pass
         print(f"Error merging video and audio: {e}")
         return False
+
+
+def sanitize_filename(filename: str, max_length: int = 120) -> str:
+    sanitized = re.sub(r'[\\/:*?"<>|\r\n]+', '_', filename).strip(' ._')
+    return sanitized[:max_length] or "untitled"
+
+
+def build_batch_item_filename(item: dict, index: int, extension: str) -> str:
+    create_time = item.get("create_time") or "0"
+    aweme_id = item.get("aweme_id") or item.get("video_id") or str(index)
+    desc = sanitize_filename(item.get("desc", ""))
+    return f"{index:03d}_{create_time}_{aweme_id}_{desc}.{extension}"
+
+
+async def write_batch_manifest(manifest_path: str, manifest_data: dict):
+    async with aiofiles.open(manifest_path, "w", encoding="utf-8") as file:
+        await file.write(json.dumps(manifest_data, ensure_ascii=False, indent=2))
+
+
+async def package_filtered_douyin_items(
+        request: Request,
+        items: list,
+        zip_file_path: str,
+        download_dir: str,
+        profile_url: str,
+        sec_user_id: str,
+        filters: dict,
+):
+    os.makedirs(download_dir, exist_ok=True)
+    headers = await DouyinWebCrawler.get_douyin_headers()
+    manifest_items = []
+    downloaded_files = []
+
+    for index, item in enumerate(items, start=1):
+        if item.get("type") == "video":
+            target_url = item.get("video_data", {}).get("nwm_video_url_HQ") or item.get("video_data", {}).get("wm_video_url_HQ")
+            if not target_url:
+                continue
+            file_name = build_batch_item_filename(item, index, "mp4")
+            file_path = os.path.join(download_dir, file_name)
+            success = await fetch_data_stream(target_url, request, headers=headers, file_path=file_path)
+            if not success:
+                continue
+            downloaded_files.append(file_path)
+            manifest_items.append({
+                "index": index,
+                "type": "video",
+                "file_name": file_name,
+                "aweme_id": item.get("aweme_id"),
+                "desc": item.get("desc"),
+                "hashtags": item.get("hashtags", []),
+                "statistics": item.get("statistics", {}),
+                "create_time": item.get("create_time"),
+            })
+        elif item.get("type") == "image":
+            image_urls = item.get("image_data", {}).get("no_watermark_image_list", [])
+            image_file_names = []
+            for image_index, image_url in enumerate(image_urls, start=1):
+                response = await fetch_data(image_url)
+                content_type = response.headers.get('content-type', 'image/jpeg')
+                extension = content_type.split('/')[-1].split(';')[0]
+                file_name = build_batch_item_filename(item, index, extension)
+                if len(image_urls) > 1:
+                    file_name = file_name.replace(f'.{extension}', f'_{image_index}.{extension}')
+                file_path = os.path.join(download_dir, file_name)
+                async with aiofiles.open(file_path, 'wb') as out_file:
+                    await out_file.write(response.content)
+                downloaded_files.append(file_path)
+                image_file_names.append(file_name)
+            manifest_items.append({
+                "index": index,
+                "type": "image",
+                "file_names": image_file_names,
+                "aweme_id": item.get("aweme_id"),
+                "desc": item.get("desc"),
+                "hashtags": item.get("hashtags", []),
+                "statistics": item.get("statistics", {}),
+                "create_time": item.get("create_time"),
+            })
+
+    manifest_path = os.path.join(download_dir, "manifest.json")
+    await write_batch_manifest(
+        manifest_path,
+        {
+            "profile_url": profile_url,
+            "sec_user_id": sec_user_id,
+            "filters": filters,
+            "total": len(manifest_items),
+            "items": manifest_items,
+        }
+    )
+    downloaded_files.append(manifest_path)
+
+    with zipfile.ZipFile(zip_file_path, 'w') as zip_file:
+        for file_path in downloaded_files:
+            if os.path.exists(file_path):
+                zip_file.write(file_path, os.path.basename(file_path))
+
+    return zip_file_path
 
 @router.get("/download", summary="在线下载抖音|TikTok|Bilibili视频/图片/Online download Douyin|TikTok|Bilibili video/image")
 async def download_file_hybrid(request: Request,
@@ -263,5 +366,98 @@ async def download_file_hybrid(request: Request,
     # 异常处理/Exception handling
     except Exception as e:
         print(e)
+        code = 400
+        return ErrorResponseModel(code=code, message=str(e), router=request.url.path, params=dict(request.query_params))
+
+
+@router.get("/download/douyin_user_posts_batch", summary="批量下载抖音用户作品/Download Douyin user posts in batch")
+async def download_douyin_user_posts_batch(
+        request: Request,
+        profile_url: str = Query(default="", description="用户主页链接/User homepage link"),
+        sec_user_id: str = Query(default="", description="用户sec_user_id/User sec_user_id"),
+        max_pages: int = Query(default=5, ge=1, le=50, description="最大抓取页数/Max pages"),
+        page_size: int = Query(default=20, ge=1, le=50, description="每页数量/Page size"),
+        max_items: int = Query(default=50, ge=1, le=200, description="最大作品数/Max items"),
+        keyword: str = Query(default="", description="标题关键词/Title keyword"),
+        tags: str = Query(default="", description="标签列表，逗号分隔/Comma separated tags"),
+        title_regex: str = Query(default="", description="标题正则/Title regex"),
+        min_digg: int = Query(default=0, ge=0, description="最低点赞数/Minimum likes"),
+        start_time: int = Query(default=0, ge=0, description="开始时间戳/Start timestamp"),
+        end_time: int = Query(default=0, ge=0, description="结束时间戳/End timestamp"),
+        aweme_type: str = Query(default="video", pattern="^(all|video|image)$", description="作品类型/all|video|image"),
+        match_mode: str = Query(default="any", pattern="^(any|all)$", description="标签匹配模式 any/all"),
+        sleep_interval: float = Query(default=0.0, ge=0.0, le=5.0, description="分页等待秒数/Page sleep interval"),
+):
+    if not config["API"]["Download_Switch"]:
+        code = 400
+        message = "Download endpoint is disabled in the configuration file. | 配置文件中已禁用下载端点。"
+        return ErrorResponseModel(code=code, message=message, router=request.url.path,
+                                  params=dict(request.query_params))
+
+    try:
+        if not profile_url and not sec_user_id:
+            raise ValueError("profile_url or sec_user_id is required")
+
+        tags_list = [tag.strip() for tag in tags.split(",") if tag.strip()]
+        batch_data = (
+            await DouyinWebCrawler.get_user_post_videos_batch_by_profile_url(
+                profile_url=profile_url,
+                max_pages=max_pages,
+                page_size=page_size,
+                max_items=max_items,
+                sleep_interval=sleep_interval,
+            )
+            if profile_url else
+            await DouyinWebCrawler.fetch_user_post_videos_batch(
+                sec_user_id=sec_user_id,
+                max_pages=max_pages,
+                page_size=page_size,
+                max_items=max_items,
+                sleep_interval=sleep_interval,
+            )
+        )
+        filtered_items = DouyinWebCrawler.filter_user_post_videos(
+            aweme_list=batch_data.get("aweme_list", []),
+            keyword=keyword,
+            tags=tags_list,
+            title_regex=title_regex,
+            min_digg=min_digg,
+            start_time=start_time or None,
+            end_time=end_time or None,
+            aweme_type=aweme_type,
+            match_mode=match_mode,
+        )
+        if not filtered_items:
+            raise ValueError("No matched Douyin posts found for current filters")
+
+        cache_key = sanitize_filename(f"{batch_data.get('sec_user_id', sec_user_id)}_{keyword}_{tags}_{aweme_type}_{len(filtered_items)}")
+        download_root = os.path.join(config.get("API").get("Download_Path"), "douyin_batch")
+        os.makedirs(download_root, exist_ok=True)
+        zip_file_name = f"douyin_user_posts_{cache_key}.zip"
+        zip_file_path = os.path.join(download_root, zip_file_name)
+
+        if not os.path.exists(zip_file_path):
+            with tempfile.TemporaryDirectory(prefix="douyin_batch_") as temp_dir:
+                await package_filtered_douyin_items(
+                    request=request,
+                    items=filtered_items,
+                    zip_file_path=zip_file_path,
+                    download_dir=temp_dir,
+                    profile_url=profile_url,
+                    sec_user_id=batch_data.get("sec_user_id") or sec_user_id,
+                    filters={
+                        "keyword": keyword,
+                        "tags": tags_list,
+                        "title_regex": title_regex,
+                        "min_digg": min_digg,
+                        "start_time": start_time,
+                        "end_time": end_time,
+                        "aweme_type": aweme_type,
+                        "match_mode": match_mode,
+                    },
+                )
+
+        return FileResponse(path=zip_file_path, filename=zip_file_name, media_type="application/zip")
+    except Exception as e:
         code = 400
         return ErrorResponseModel(code=code, message=str(e), router=request.url.path, params=dict(request.query_params))
